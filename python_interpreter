@@ -1,0 +1,12 @@
+#This is proof to show python will compile first and create byte code called .pyc file
+#Once you execute this command python -m python_interpreter.py in shell or cmd it will create byte (This is what we created creating just to showcase pyhton compiles file first)
+#When we are not using -m during runtime python atomatically create compile file and delete it after execution
+
+
+#steps:- 
+#python -m python_interpreter.py
+#python python_interpreter.pyc
+
+
+print("Hi Programmer")
+print("Hope your doing great today")
