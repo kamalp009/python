@@ -1,0 +1,15 @@
+fout=open("out.csv","a")
+# first file:
+for line in open("feb_1.csv"):
+    fout.write(line)
+# now the rest:    
+for num in range(2,30):
+   print(num)
+   if num != 4:
+      f = open("feb_"+str(num)+".csv")
+      # f.next() # skip the header
+      for line in f:
+         fout.write(line)
+      f.close() # not really needed
+      
+fout.close()
