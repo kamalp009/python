@@ -1,0 +1,578 @@
+# -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+
+from django.shortcuts import render
+from django.views.generic import View
+from rest_framework.views import APIView
+from django.http import HttpResponse,JsonResponse
+import boto3
+import re
+import csv
+import json
+#import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import smtplib
+import pytz
+import time
+import math
+import mysql.connector
+import locale
+from datetime import datetime
+from django.utils.encoding import smart_str
+ist = pytz.timezone('UTC')
+# Create your views here.
+
+# Converts start_time and end_time strings from IST to UTC time 
+# to feed into AWS boto3 query
+def IST_to_UTC(start_str, end_str):
+    start_obj = datetime.strptime(start_str,'%m/%d/%Y %I:%M %p')
+    end_obj = datetime.strptime(end_str,'%m/%d/%Y %I:%M %p')
+    # return start_obj, end_obj
+    ist = pytz.timezone('Asia/Kolkata')
+    utc = pytz.timezone('UTC')
+    start_obj = ist.localize(start_obj)
+    utc_start_obj = start_obj.astimezone(utc)
+    end_obj = ist.localize(end_obj)
+    utc_end_obj = end_obj.astimezone(utc)
+    ###print('IST time----',start_obj, end_obj)
+    ###print('UTC time----',utc_start_obj, utc_end_obj)
+    return utc_start_obj, utc_end_obj
+
+# Generates contiguous blocks of size k from given array arr
+def block_generator(arr, k):
+    n = len(arr)
+    return [arr[i:i+k] for i in range(0,n,k)]
+
+class Get_Report(View):
+
+    """ This method sends a boto3 query based on function arguments
+    returns a response containing the query_id which is 
+    used to send a second request. """
+
+    def send_request(self, client ,group_name, start_time, end_time, querystr):
+        all_request = client.start_query(
+            logGroupName=group_name,
+            startTime=start_time,
+            endTime=end_time,
+            queryString=querystr,
+            limit=10000
+        )
+        return all_request
+    
+    """ This method sends a request based on query_id to retreive
+    all the log files and returns a list of all the logs """
+
+    def get_data_from_queryid(self, client, query_id, params):
+        vendor_data = []
+        all_request_count = client.get_query_results(
+            queryId = query_id
+        )
+
+        # If the request is not complete, send the request again
+
+        while all_request_count['status'] != 'Complete':
+            time.sleep(1)
+            # ###print('Wait....')
+            all_request_count = client.get_query_results(
+                queryId = query_id
+            )
+            # ###print(all_request_count['status'],all_request_count['statistics']['recordsMatched'])
+
+        # Add the result data onto vendor_data
+        vendor_data += all_request_count['results']
+        ###print('Total count is ----------',all_request_count['statistics']['recordsMatched'])
+        ###print('full data ----------',len(vendor_data))
+
+        # No records found, hence result is empty
+        if all_request_count['statistics']['recordsMatched']==0:
+            return []
+
+        get_repeat_val = 0
+
+        # Since the max limit for fetching data is 10000, we have to 
+        # execute the same query for next 10000 logs, this should 
+        # go on until all logs are successfully fetched
+
+        if all_request_count['statistics']['recordsMatched'] > 10000:
+
+            # get_repeat_val is the number of queries required to 
+            # fetch all logs
+
+            get_repeat_val = math.ceil(all_request_count['statistics']['recordsMatched']/10000) - 1
+
+            # last_value is the timestamp of 10000th record
+            last_value = all_request_count['results'][len(all_request_count['results'])-1][0]['value']
+            ###print("last value",last_value)
+
+            for w in range(get_repeat_val):
+                st_time = time.time()
+                ###print('last_value is -------',last_value) 
+                dt_obj = datetime.strptime(last_value,'%Y-%m-%d %H:%M:%S.%f')
+                millisec = dt_obj.timestamp()
+                """all_request1 = client.start_query(
+                    logGroupName=group_name,
+                    startTime=int(millisec),
+                    endTime=end_time,
+                    queryString=querystr,
+                    limit=10000
+                )"""
+                params_copy = params.copy()
+
+                # start_time of next query would be the end_time of previous query
+                params_copy['start_time'] = int(millisec)+1
+                all_request1 = self.send_request(**params_copy)
+                time.sleep(1)
+                all_request_count1 = client.get_query_results(
+                queryId = all_request1['queryId']
+                )
+
+                # TODO: Wrap the repeated queries into a function
+                while all_request_count1['status'] != 'Complete':
+                   time.sleep(1)
+                   # ###print('Wait....')
+                   all_request_count1 = client.get_query_results(
+                       queryId = all_request1['queryId']
+                   )
+                   # ###print(all_request_count1['status'],all_request_count1['statistics']['recordsMatched'])
+
+
+                vendor_data += all_request_count1['results']
+                ed_time = time.time()
+                ###print('time taken inside loop', ed_time-st_time)
+                print("total count inside loop------- ",all_request_count1['statistics']['recordsMatched'])
+                ###print('full data ----------',len(vendor_data))
+                last_value = all_request_count1['results'][-1][0]['value']
+        
+
+        ###print("vendor_data--",len(vendor_data))
+        return vendor_data
+    
+    """
+        This function is a combination of send_request and get_data_from_queryid
+    """
+    def get_data(self, params):
+        response = self.send_request(**params)
+        return self.get_data_from_queryid(params['client'], response['queryId'], params)
+    
+    """
+        Accepts start_date and end_date in string format (%Y-%m-%d %H:%M:%S.%f)
+        Returns time difference in seconds between start_date and end_date
+    """
+    def get_time_difference(self, start_date, end_date):
+        try:
+            start_obj = datetime.strptime(start_date,'%Y-%m-%d %H:%M:%S.%f')
+            end_obj = datetime.strptime(end_date,'%Y-%m-%d %H:%M:%S.%f')
+            return end_obj.timestamp() - start_obj.timestamp()
+        except Exception as e:
+            return -1
+
+    """
+        Retrieves message_id from given log
+    """
+    def get_message_id(self, data):
+        message_data = data[1]
+        message_value = message_data['value']
+        msg_id = message_value.split(')')[0]
+        msg_id = msg_id[1:]
+        return msg_id
+    
+    """
+        Returns the type of message (e.g. Method response before transformation, 
+        Endpoint request URI, etc.) for given log
+    """
+    def get_message_type(self, data):
+        message_data = data[1]['value']
+        msg_without_msgid = message_data.split(')')[1]
+        return msg_without_msgid.split(':')[0].strip()
+    
+    """
+        Retreives url from given log
+    """
+    def get_message_url(self, data):
+        message_data = data[1]['value']
+        ##print(message_data)
+        msg_without_msgid = message_data.split('Endpoint request URI: ')[1]
+        url = msg_without_msgid.split("'")[0]
+        return url
+    
+    """
+        Converts given response log into dictionary
+        Return type: {
+            "timestamp" : timestamp of response,
+            "metadata" : json consisting of data such as status, payload, etc.
+        }
+    """
+    def filter_response(self, response_message):
+        try: 
+            timestamp = response_message[0]['value']
+            message_value = response_message[1]['value']
+            response_obj = message_value.split('Method response body after transformations: ')[1]
+            # response_obj = response_obj.split("'")[0]
+            # response = json.loads(response_obj)
+            response = response_obj
+            ###print(response)
+            return {
+                'timestamp' : timestamp,
+                'metadata': response
+            }
+        except Exception as e:
+            ###print('Exception in response, {}, returning None'.format(response_message))
+            ###print(e)
+            ###print('response_obj',response_obj, end = '\n\n\n')
+            return None
+
+    """
+        Converts given response log into dictionary
+        Return type: {
+            "timestamp" : timestamp of response,
+            "metadata" : json consisting of data such as status, payload, etc.
+        }
+    """
+    def filter_request(self, request_message):
+        try: 
+            message_value = request_message[1]['value']
+            request_obj = message_value.split('Method request body before transformations: ')[1]
+            #request = json.loads(request_obj)
+            # ###print(request_obj)
+            return json.loads(request_obj)
+        except Exception as e:
+            ###print('Exception in request, {}, returning None'.format(request_message))
+            ###print(e)
+            ###print('req_obj',request_obj, end = '\n\n\n')
+            return None
+
+    """
+        Filters vendor_data obtained from query 
+        Also filters responses which do not contain the required_url
+    """
+    
+    def filter_request_response(self, vendor_data, required_url):
+        l = 1
+        """
+[{'field': '@timestamp', 'value': '2020-01-22 21:11:36.667'}, {'field': '@message', 'value': '(58336d31-2664-4e42-b074-34855405ffd2) Method request body before transformations: {"pan_id":"AOSPP2269L","request_id":"Mi414116084849049600","mobile":"999999999","vendor_name":"Xiaomi"}'}, {'field': '@ptr', 'value': 'CnQKOwo3MTA5NDIwMTYyMTY5OkFQSS1HYXRld2F5LUV4ZWN1dGlvbi1Mb2dzX2dncDI5bHg0N2cvcHJvZBAHEjUaGAIF4m85TAAAAAAJFWjkAAXii6UQAAABwiABKNnL4vj8LTCb8uL4/C04DEC9HEiLGFC4FBAEGAE='}]
+
+[{'field': '@timestamp', 'value': '2020-01-22 21:11:36.667'}, {'field': '@message', 'value': '(58336d31-2664-4e42-b074-34855405ffd2) Endpoint request URI: https://django.abfldirect.com/nsdl/get_nsdl/'}, {'field': '@ptr', 'value': 'CnQKOwo3MTA5NDIwMTYyMTY5OkFQSS1HYXRld2F5LUV4ZWN1dGlvbi1Mb2dzX2dncDI5bHg0N2cvcHJvZBAHEjUaGAIF4m85TAAAAAAJFWjkAAXii6UQAAABwiABKNnL4vj8LTCb8uL4/C04DEC9HEiLGFC4FBAFGAE='}]
+
+[{'field': '@timestamp', 'value': '2020-01-22 21:11:41.595'}, {'field': '@message', 'value': '(58336d31-2664-4e42-b074-34855405ffd2) Method response body after transformations: {"status":200,"data":{"PAN-title":"Shri","Middle-Name":"","Last-Name":"PERAGIGAYAL","PAN Id":"AOSPP2269L","PAN-Status":"Existing and Valid PAN","First-Name":"SRINIVAS REDDY","Status code":"1","Last-update-date":"23/06/2006"},"description":"PAN verification successful"}'}, {'field': '@ptr', 'value': 'CnQKOwo3MTA5NDIwMTYyMTY5OkFQSS1HYXRld2F5LUV4ZWN1dGlvbi1Mb2dzX2dncDI5bHg0N2cvcHJvZBAHEjUaGAIF4m85TAAAAAAJFWjkAAXii6UQAAABwiABKNnL4vj8LTCb8uL4/C04DEC9HEiLGFC4FBAKGAE='}]
+        """
+        msgid_data = {}
+        result = {}
+        #just_data = [vendor_data[0],vendor_data[1],vendor_data[2],vendor_data[3]]
+        for data in vendor_data:
+
+            ##print("msg--",data[0]['value'])
+            # if '7916656a-9763-42f6-b2ec-58c5c694ae56' in data[0]['value']:
+            ###print(data[1]['value'])
+            ##print("----------")
+            
+            message_type = self.get_message_type(data)
+            msg_id = self.get_message_id(data)
+
+            if msgid_data.get(msg_id):
+                if 'Xiaomi' in data[1]['value']:
+                    #print("i am in xiami")
+                    msgid_data[msg_id]['vender'] = 'Xiaomi'
+
+                elif 'XIAOMI' in data[1]['value']:
+                    #print("i am in XIAOMI")
+                    msgid_data[msg_id]['vender'] = 'Xiaomi'
+
+                elif 'Mobikwik' in data[1]['value']:
+                    #print("i am in mobi")
+                    msgid_data[msg_id]['vender'] = 'Mobikwik'
+
+                elif 'ola' in data[1]['value']:
+                    #print("i am in ola")
+                    msgid_data[msg_id]['vender'] = 'ola'
+            else:
+                if 'Xiaomi' in data[1]['value']:
+                    #print("i am in xiami")
+                    msgid_data[msg_id]={'vender': 'Xiaomi'}
+
+                elif 'XIAOMI' in data[1]['value']:
+                    #print("i am in XIAOMI")
+                    msgid_data[msg_id]={'vender': 'Xiaomi'}
+
+                elif 'Mobikwik' in data[1]['value']:
+                    #print("i am in mobi")
+                    msgid_data[msg_id]={'vender': 'Mobikwik'}
+
+                elif 'ola' in data[1]['value']:
+                    #print("i am in ola")
+                    msgid_data[msg_id]={'vender':'ola'}
+
+            if message_type == "Method request body before transformations":
+                ##print("i am in request")
+                if msgid_data.get(msg_id):
+                    ##print("i am in if")
+                    msgid_data[msg_id]['req_timestamp'] = data[0]['value']
+                    msgid_data[msg_id]['req_body'] = self.filter_request(data)
+                    
+
+                else:
+                    ##print("i am in else")
+                    msgid_data[msg_id] = {'req_timestamp': data[0]['value']}
+                    msgid_data[msg_id] = {
+                        'req_timestamp': data[0]['value'],
+                        'req_body': self.filter_request(data)
+                    }
+                   
+            elif message_type == "Method response body after transformations":
+                ##print("i am in response")
+                ###print("in res--")
+                if msgid_data.get(msg_id):
+                    #msgid_data[msg_id]['req_timestamp'] = data[0]['value']
+                    msgid_data[msg_id]['response'] = self.filter_response(data)
+                else:
+                    msgid_data[msg_id] = {'response': self.filter_response(data)}
+
+            elif message_type == "Endpoint request URI":
+                #elif message_type == "Endpoint request URI":
+                ##print("i am in url",required_url)
+                l=l+1
+                message_url = self.get_message_url(data)
+                # ##print("url--",message_url)
+                # if required_url in message_url:
+                    # ##print("i am in")
+                if msgid_data.get(msg_id):
+                    msgid_data[msg_id]['url'] = message_url
+                else:
+                    msgid_data[msg_id] = {'url': message_url}
+
+            # Only consider messages/logs which contain request and url
+            
+            
+            if msgid_data.get(msg_id):
+                ###print(msgid_data[msg_id])
+                ##print("OUT--",msgid_data[msg_id].get('url'))
+                ##print("in--",msgid_data[msg_id].get('req_timestamp'))
+                
+                if msgid_data[msg_id].get('req_timestamp') and msgid_data[msg_id].get('url'):
+                   
+                    result[msg_id] = msgid_data[msg_id]
+            
+        ##print("i am in",msgid_data)
+        return result
+
+    """
+        Converts filtered_data obtained from filter_request_response() 
+        into JSON response 
+    """
+    def generate_final_data(self, filtered_data, client_name,api_details):
+        final_data = []
+        response_body = None
+        for msg_id in filtered_data:
+            data = filtered_data[msg_id]
+            response = data.get('response')
+            vender = data.get('vender')
+            request_data = str(data.get('req_body'))
+
+            response_data = str(data.get('response'))
+            start_date = data['req_timestamp']
+            # time_diff = -1
+            success = 'true'
+            temp = {}
+            if response:
+                end_date = response['timestamp']
+                time_diff = self.get_time_difference(start_date, end_date)
+            
+                if time_diff == -1:
+                    end_date = 'null'
+                    success = 'indeterminate'
+                    time_diff = 'null'
+
+                try:
+                    response['metadata'] = json.loads(response['metadata'])
+                    if response['metadata']['status'] != 200:
+                        success = 'false'
+                        temp['request_body'] = str(data.get('req_body'))
+                        temp['response_body'] = str(response['metadata'])
+                except Exception as e:
+                    ###print('Not JSON', response['metadata'])
+                    temp['request_body'] = str(data.get('req_body'))
+                    response_body = response['metadata']
+                    temp['response_body'] = response_body
+
+            if client_name != 'All':
+                if vender == client_name:
+                    if api_details != 'All':
+                        if api_details in data['url']:
+                            temp = {
+                                **temp,
+                                'message_id': msg_id,
+                                'start_date': start_date,
+                                'request_url': data['url'],
+                                'vendor': vender,
+                                'end_date': end_date,
+                                'success': success,
+                                'diff': time_diff,
+                                'request_body': request_data,
+                                'response_body': response_data
+                            }
+                            final_data.append(temp)
+                        
+                    else:
+                        temp = {
+                            **temp,
+                            'message_id': msg_id,
+                            'start_date': start_date,
+                            'request_url': data['url'],
+                            'vendor': vender,
+                            'end_date': end_date,
+                            'success': success,
+                            'diff': time_diff,
+                            'request_body': request_data,
+                            'response_body': response_data
+                        }
+                        final_data.append(temp)
+                        
+            else:
+                if api_details != 'All':
+                    if api_details in data['url']:
+                        temp = {
+                        **temp,
+                        'message_id': msg_id,
+                        'start_date': start_date,
+                        'request_url': data['url'],
+                        'vendor': vender,
+                        'end_date': end_date,
+                        'success': success,
+                        'diff': time_diff,
+                        'request_body': request_data,
+                        'response_body': response_data
+                    }
+                    final_data.append(temp)
+                    
+                else:
+                    temp = {
+                        **temp,
+                        'message_id': msg_id,
+                        'start_date': start_date,
+                        'request_url': data['url'],
+                        'vendor': vender,
+                        'end_date': end_date,
+                        'success': success,
+                        'diff': time_diff,
+                        'request_body': request_data,
+                        'response_body': response_data
+                    }
+                    final_data.append(temp)
+                   
+            #if not response or response['metadata']['status'] != 200:
+            #temp['request_body'] = str(data.get('req_body'))
+
+            
+        return final_data
+
+    def post(self, request):
+
+        client = boto3.client('logs')
+
+        # csv_columns = ['message_id','start_date','request_url','end_date','vendor','success','diff']
+
+        today = datetime.now()
+        request_data = eval(request.body.decode('utf-8'))
+        ###print("Client is",request_data['clientName'])
+
+        final_result = []
+
+        
+        print(request_data)
+
+        start_time, end_time = IST_to_UTC(request_data['startTimestamp'],request_data['endTimestamp'])
+        start_time, end_time = int(start_time.timestamp()), int(end_time.timestamp())
+        print('Time in milliseconds ----- ', start_time, end_time)
+        diff = abs(int((float(start_time)-float(end_time))/(60*60*24)))
+        def call_functions(start_date,end_date):
+
+
+            print("dates---",start_date,end_date)
+
+            # Params to be passed into the query
+            # The query fetches all the messages/logs consisting of request from given vendor name
+            # and all responses and URIs for efficient filtering
+            params = {
+                'client' : client,
+                'group_name' : "API-Gateway-Execution-Logs_ggp29lx47g/prod",
+                'start_time' : start_time,
+                'end_time' : end_time,
+                'querystr' : """fields @timestamp, @message
+                    | sort @timestamp asc"""
+            }
+
+            ##print(params)
+            vendor_data = self.get_data(params)
+            ##print("total vendor records fetched ---- ", len(vendor_data))
+
+            if vendor_data == []:
+                return HttpResponse([])
+
+            # params['querystr'] = """fields @timestamp, @message
+            #         | sort @timestamp asc """
+            # newdata = self.get_data(params)
+            #with open('vendor_data.txt','w') as f:
+            #    f.write('-------------- VENDOR DATA --------------\n\n\n') 
+
+            #for data in vendor_data:
+            #    with open('vendor_data.txt','a') as f:
+            #        f.write(str(data)+'\n\n')
+            ###print('Filtering data.......')
+            filtered_data = self.filter_request_response(vendor_data, request_data['api'])
+            ##print('Data filtered, length is', len(filtered_data))
+            final_data = self.generate_final_data(filtered_data, request_data['clientName'],request_data['api'])
+            final_result.append(final_data)
+            return final_result
+
+
+            
+
+        start_date_final = start_time
+
+        end_date_final = end_time
+        diff += diff
+        print(diff)
+        if diff != 0:
+            for w in range(diff):
+                if diff >= 1:
+                        print("if---",w)
+                        end_date_final = start_date_final+50000
+                        call_functions(start_date_final,end_date_final)
+                        start_date_final = end_date_final
+                        #call functions
+                        diff-=1
+                else:
+                    print("i am in else")
+                    start_date_final = end_date_final
+                    end_date_final = end_time
+                    call_functions(start_date_final,end_date_final)
+        else:
+            call_functions(start_date_final,end_date_final)
+
+
+        print(len(final_result))
+
+        analysis = {'success_data':0,'failure_data':0,'overall_success_rate':0,'average_response_rate':0}
+        final_data = []
+        for data in final_result:
+            for data1 in data:
+                final_data.append(data1)
+                if data1['success'] == 'true':
+                    analysis['success_data'] += 1
+                else:
+                    analysis['failure_data'] += 1
+                
+                analysis['average_response_rate'] += data1['diff']
+                
+            analysis['overall_success_rate'] = analysis['success_data']*100/len(data)
+            analysis['average_response_rate'] = analysis['average_response_rate']/len(data)
+            
+
+
+        #print(analysis)
+
+        ###print("###printed--",final_data)
+        return HttpResponse(json.dumps(final_data))
+
